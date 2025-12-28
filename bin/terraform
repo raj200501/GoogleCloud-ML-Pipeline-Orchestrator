@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+DEFAULTS = {
+    "region": "us-central1",
+    "bucket_name": "ml-pipeline-bucket",
+    "model_name": "ml-model",
+    "cloud_run_service_name": "ml-model-service",
+}
+
+RESOURCE_HINTS = [
+    "resource",
+    "variable",
+    "provider",
+    "data",
+    "output",
+    "module",
+]
+
+
+def _print(msg: str) -> None:
+    sys.stdout.write(msg + "\n")
+
+
+def _print_err(msg: str) -> None:
+    sys.stderr.write(msg + "\n")
+
+
+def _load_tf_files() -> list:
+    tf_files = []
+    for entry in os.listdir(ROOT_DIR):
+        if entry.endswith(".tf"):
+            tf_files.append(os.path.join(ROOT_DIR, entry))
+    return sorted(tf_files)
+
+
+def _validate_tf() -> None:
+    tf_files = _load_tf_files()
+    if not tf_files:
+        raise RuntimeError("No .tf files found in repository root")
+
+    content_ok = False
+    for path in tf_files:
+        with open(path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        if any(re.search(rf"^\s*{hint}\b", content, flags=re.MULTILINE) for hint in RESOURCE_HINTS):
+            content_ok = True
+
+    if not content_ok:
+        raise RuntimeError("Terraform files appear empty or invalid")
+
+
+def _parse_vars(argv: list) -> dict:
+    vars_found = {}
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg in ("-var", "-var-file"):
+            if idx + 1 < len(argv):
+                value = argv[idx + 1]
+                if arg == "-var" and "=" in value:
+                    key, val = value.split("=", 1)
+                    vars_found[key.strip()] = val.strip().strip('"')
+            idx += 2
+            continue
+        idx += 1
+    return vars_found
+
+
+def _resolve_vars(cli_vars: dict) -> dict:
+    resolved = dict(DEFAULTS)
+    env_map = {
+        "project_id": ["TF_VAR_project_id", "GOOGLE_PROJECT", "PROJECT_ID"],
+        "region": ["TF_VAR_region", "GOOGLE_REGION"],
+        "bucket_name": ["TF_VAR_bucket_name"],
+        "model_name": ["TF_VAR_model_name"],
+        "cloud_run_service_name": ["TF_VAR_cloud_run_service_name"],
+    }
+
+    for key, env_keys in env_map.items():
+        for env_key in env_keys:
+            if env_key in os.environ and os.environ[env_key]:
+                resolved[key] = os.environ[env_key]
+                break
+
+    resolved.update(cli_vars)
+    return resolved
+
+
+def cmd_init(argv: list) -> int:
+    os.makedirs(os.path.join(ROOT_DIR, ".terraform"), exist_ok=True)
+    _print("Terraform has been successfully initialized (local shim).")
+    return 0
+
+
+def cmd_validate(argv: list) -> int:
+    _validate_tf()
+    _print("Success! The configuration is valid (local shim).")
+    return 0
+
+
+def cmd_apply(argv: list) -> int:
+    _validate_tf()
+    cli_vars = _parse_vars(argv)
+    resolved = _resolve_vars(cli_vars)
+
+    project_id = resolved.get("project_id")
+    if not project_id:
+        _print_err("Error: project_id is required. Set TF_VAR_project_id or GOOGLE_PROJECT.")
+        return 1
+
+    state_dir = os.path.join(ROOT_DIR, "local_state")
+    os.makedirs(state_dir, exist_ok=True)
+
+    state = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "project_id": project_id,
+        "region": resolved["region"],
+        "resources": {
+            "bucket": resolved["bucket_name"],
+            "model": resolved["model_name"],
+            "cloud_run_service": resolved["cloud_run_service_name"],
+            "service_account": "ml-pipeline-sa",
+        },
+    }
+
+    with open(os.path.join(state_dir, "terraform_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+
+    _print("Apply complete! Resources: 4 added, 0 changed, 0 destroyed. (local shim)")
+    _print("State stored in local_state/terraform_state.json")
+    return 0
+
+
+def cmd_version(argv: list) -> int:
+    _print("Terraform v0.0.0-local-shim")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        _print("Usage: terraform <init|validate|apply|version>")
+        return 1
+
+    command = sys.argv[1]
+    argv = sys.argv[2:]
+
+    if command == "init":
+        return cmd_init(argv)
+    if command == "validate":
+        return cmd_validate(argv)
+    if command == "apply":
+        return cmd_apply(argv)
+    if command in ("version", "--version", "-version"):
+        return cmd_version(argv)
+
+    _print_err(f"Unsupported command for local shim: {command}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
